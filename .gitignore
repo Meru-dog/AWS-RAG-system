@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# AWS CDK
+cdk.out/
+*.js
+!jest.config.js
+*.d.ts
+node_modules/
+.cdk.staging/
+cdk.context.json
+
+# Lambda レイヤー・ビルド成果物(依存の実体はコミットしない)
+infra/lambda/layer/
+layer/
+*.zip
+package/
+
+# 認証情報・秘匿情報(誤コミット防止)
+*.pem
+*.key
+.env
+.env.*
+*credentials*
+*secret*
+
+# 評価の中間生成物
+*_output.jsonl
+eval-results/
+
+# OS / エディタ
+.DS_Store
+.idea/
+.vscode/
+*.swp
