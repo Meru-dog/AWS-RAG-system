@@ -5,6 +5,13 @@
 
 > 固有値(アカウント ID・エンドポイント URL・リソース ID 等)はすべてプレースホルダ化しています。
 
+# Architecture
+
+This document illustrates the system configuration, data flow, and data residency design.
+Diagrams are written in Mermaid notation, which renders natively on GitHub.
+
+> All unique values (account ID, endpoint URL, resource ID, etc.) have been replaced with placeholders.
+
 ---
 
 ## 1. システム全体構成
@@ -59,6 +66,58 @@ flowchart TB
     L -->|"presigned URL 発行"| DOCB
 ```
 
+## 1. Overall System Configuration
+
+```mermaid
+flowchart TB
+    subgraph Client["Browser (User)"]
+        UI["Single-file SPA<br/>index.html"]
+    end
+
+    subgraph Edge["Delivery Layer"]
+        CF["CloudFront + OAC"]
+    end
+
+    subgraph Auth["Authentication Layer (Amazon Cognito)"]
+        HUI["Hosted UI<br/>(Authorization Code + PKCE)"]
+        UP["User Pool +<br/>public client"]
+    end
+
+    subgraph App["Application Layer"]
+        FU["Lambda Function URL<br/>(CORS / AuthType: NONE)"]
+        L["Lambda (Python 3.13)<br/>Auth Validation · RAG ·<br/>Upload · Masking · Auditing"]
+        LAYER["PyJWT Layer"]
+    end
+
+    subgraph RAG["RAG Layer (Amazon Bedrock)"]
+        KB["Knowledge Base"]
+        EMB["Titan Embeddings V2"]
+        VEC["S3 Vectors"]
+        GEN["Claude Sonnet<br/>(Japan Domestic Inference)"]
+    end
+
+    subgraph Storage["Storage Layer (S3, Tokyo Fixed)"]
+        DOCB["Document Bucket<br/>UI + documents/"]
+        AUDB["Audit Log Bucket<br/>Encryption / Versioning /<br/>Lifecycle"]
+    end
+
+    UI -->|"1. Login"| HUI
+    HUI --- UP
+    UI -->|"2. Static Delivery"| CF
+    CF -->|"OAC"| DOCB
+    UI -->|"3. Bearer Token"| FU
+    FU --> L
+    L --- LAYER
+    L -->|"Token Validation"| UP
+    L -->|"Retrieve + Generate"| KB
+    KB --- EMB
+    KB --- VEC
+    KB --- GEN
+    KB -.->|"Reference"| DOCB
+    L -->|"Audit Record"| AUDB
+    L -->|"Presigned URL Issuance"| DOCB
+```
+
 ---
 
 ## 2. 質問処理のシーケンス
@@ -80,6 +139,27 @@ sequenceDiagram
     B-->>L: 回答 + 引用
     L->>A: 監査記録<br/>(利用者/質問/回答/引用/時刻)
     L-->>U: 引用付き回答
+```
+
+## 2. Query Processing Sequence
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant C as Cognito (Hosted UI)
+    participant L as Lambda
+    participant B as Bedrock KB
+    participant A as Audit Log (S3)
+
+    U->>C: Login (Authorization Code + PKCE)
+    C-->>U: ID Token
+    U->>L: Query + Authorization: Bearer
+    L->>L: ID Token Validation<br/>(RS256/aud/iss/exp/token_use)
+    L->>L: Identify User by sub
+    L->>B: RetrieveAndGenerate
+    B-->>L: Response + Citations
+    L->>A: Audit Record<br/>(User / Query / Response / Citations / Timestamp)
+    L-->>U: Response with Citations
 ```
 
 ---
@@ -109,6 +189,33 @@ sequenceDiagram
         L->>B: 取り込みジョブ起動
     end
     B-->>B: ベクトル化・インデックス
+```
+
+## 3. Upload, Automated Ingestion, and PII Masking Sequence
+
+```mermaid
+sequenceDiagram
+    participant U as Browser
+    participant L as Lambda
+    participant S as S3 (documents/)
+    participant B as Bedrock KB
+
+    U->>L: Upload Request (Bearer)
+    L->>L: Token Validation
+    L-->>U: Presigned URL (PUT)
+    U->>S: Direct File PUT
+    S->>L: S3 Event (ObjectCreated)
+    alt Not Masked (No Metadata)
+        L->>S: Retrieve Document (GetObject)
+        L->>L: PII Masking via Regex<br/>(Email / Phone / Card)
+        L->>S: Write Back with Masking<br/>(Metadata: pii-masked=true)
+        Note over L,S: Write-back Triggers Another Event
+        L->>B: Start Ingestion Job
+    else Already Masked (Metadata Present)
+        Note over L: Skip Masking<br/>(Loop Terminates in One Pass)
+        L->>B: Start Ingestion Job
+    end
+    B-->>B: Vectorize and Index
 ```
 
 ---
@@ -142,6 +249,33 @@ flowchart LR
 In-Region 非対応のため、推論のみ日本国内(東京・大阪)に限定するクロスリージョン推論
 プロファイルを用います。Global 推論は IAM レベルで禁止しています。
 
+## 4. Asymmetric Data Residency Design
+
+```mermaid
+flowchart LR
+    subgraph Tokyo["Tokyo Region (Storage=Fully Fixed)"]
+        S3D["Documents / Vectors / Audit Logs"]
+    end
+
+    subgraph JP["Within Japan (Inference Only)"]
+        T["Tokyo"]
+        O["Osaka"]
+    end
+
+    GLOBAL["Global Inference<br/>(Prohibited via IAM)"]
+
+    S3D -->|"Storage Fixed to Tokyo"| S3D
+    S3D -.->|"Inference Request"| T
+    S3D -.->|"Inference Request"| O
+    S3D -. "Prohibited" .-x GLOBAL
+
+    style GLOBAL stroke-dasharray: 5 5,color:#999
+    style Tokyo fill:#eef2f3
+    style JP fill:#eef7ee
+```
+
+While storage (documents, vectors, audit logs) is fully fixed to the Tokyo region, the generative model does not support Tokyo In-Region inference, so a cross-region inference profile limited to within Japan (Tokyo and Osaka) is used for inference only. Global inference is prohibited at the IAM level.
+
 ---
 
 ## 5. IaC のスタック構成
@@ -172,3 +306,29 @@ flowchart TB
 
 Knowledge Base は L2 コンストラクト非対応かつ S3 Vectors との結合が複雑で、IaC 完全再現の
 費用対効果が低いため、既存リソースを ID 参照する形にとどめ、構築手順は別途文書化しています。
+
+## 5. IaC Stack Configuration
+
+As the system is small-scale and resources are tightly coupled (the document bucket is connected in multiple directions to CloudFront, Lambda, and event notifications), everything is consolidated into a single stack. Splitting the stack would create bidirectional references in the OAC bucket policy and S3 event notifications, causing circular dependencies.
+
+```mermaid
+flowchart TB
+    subgraph RagStack["RagStack (Single Stack)"]
+        direction TB
+        B1["S3: Audit Log / Documents"]
+        C1["Cognito: User Pool / client / domain"]
+        D1["CloudFront + OAC"]
+        L1["Lambda + Function URL + IAM"]
+        N1["S3 Event Notification (documents/ → Lambda)"]
+    end
+
+    KBExt["Knowledge Base<br/>(References Existing ID · Manual Construction)"]
+
+    L1 -.->|"ID Reference"| KBExt
+    B1 --- D1
+    B1 --- N1
+    N1 --- L1
+    D1 --- B1
+```
+
+Knowledge Base is not covered by L2 constructs and has complex coupling with S3 Vectors, making full IaC reproduction cost-ineffective; therefore, it is handled by referencing the existing resource ID, and the construction procedure is documented separately.
